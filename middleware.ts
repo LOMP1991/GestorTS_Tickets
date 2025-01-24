@@ -1,75 +1,127 @@
-import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs"
-import { NextResponse } from "next/server"
-import type { NextRequest } from "next/server"
+import { createServerClient, type CookieOptions } from "@supabase/ssr"
+import { type NextRequest, NextResponse } from "next/server"
 
-export async function middleware(req: NextRequest) {
+export async function middleware(request: NextRequest) {
   try {
-    // Don't run middleware on static files and api routes
-    if (
-      req.nextUrl.pathname.startsWith("/_next") ||
-      req.nextUrl.pathname.startsWith("/api") ||
-      req.nextUrl.pathname.startsWith("/static") ||
-      req.nextUrl.pathname.includes("favicon.ico") ||
-      req.nextUrl.pathname.includes(".png")
-    ) {
-      return NextResponse.next()
-    }
+    // Create an unmodified response
+    let response = NextResponse.next({
+      request: {
+        headers: request.headers,
+      },
+    })
 
-    const res = NextResponse.next()
-    const supabase = createMiddlewareClient({ req, res })
+    // Create the Supabase client
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          get(name: string) {
+            return request.cookies.get(name)?.value
+          },
+          set(name: string, value: string, options: CookieOptions) {
+            request.cookies.set({
+              name,
+              value,
+              ...options,
+            })
+            response = NextResponse.next({
+              request: {
+                headers: request.headers,
+              },
+            })
+            response.cookies.set({
+              name,
+              value,
+              ...options,
+            })
+          },
+          remove(name: string, options: CookieOptions) {
+            request.cookies.delete({
+              name,
+              ...options,
+            })
+            response = NextResponse.next({
+              request: {
+                headers: request.headers,
+              },
+            })
+            response.cookies.delete({
+              name,
+              ...options,
+            })
+          },
+        },
+      },
+    )
+
+    // Get the current pathname
+    const path = request.nextUrl.pathname
+
+    // Define public routes that don't require authentication
+    const isPublicRoute =
+      path === "/login" ||
+      path === "/signup" ||
+      path === "/auth/callback" ||
+      path.startsWith("/_next") ||
+      path.startsWith("/api") ||
+      path.includes("favicon.ico")
 
     // Refresh session if possible
     const {
       data: { session },
-      error,
     } = await supabase.auth.getSession()
 
-    if (error) {
-      console.error("Middleware - Auth Error:", error)
-      // Clear any invalid session data
-      if (error.message.includes("Invalid Refresh Token")) {
-        const response = NextResponse.redirect(new URL("/login", req.url))
-        response.cookies.delete("sb-refresh-token")
-        response.cookies.delete("sb-access-token")
-        return response
-      }
-    }
-
-    // Add debug logging in production
-    console.log("Middleware - Auth Status:", {
+    // Add debug logging
+    console.log("Auth Middleware:", {
+      path,
       hasSession: !!session,
-      path: req.nextUrl.pathname,
+      isPublicRoute,
       timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV,
     })
 
-    // If there's no session and trying to access protected routes
-    if (!session && !req.nextUrl.pathname.startsWith("/login") && !req.nextUrl.pathname.startsWith("/signup")) {
-      const redirectUrl = req.nextUrl.clone()
-      redirectUrl.pathname = "/login"
-      redirectUrl.searchParams.set("from", req.nextUrl.pathname)
+    // Handle authentication logic
+    if (!session && !isPublicRoute) {
+      // Redirect to login if accessing protected route without session
+      const redirectUrl = new URL("/login", request.url)
+      redirectUrl.searchParams.set("from", path)
       return NextResponse.redirect(redirectUrl)
     }
 
-    return res
+    if (session && (path === "/login" || path === "/signup")) {
+      // Redirect to home if accessing auth pages with active session
+      return NextResponse.redirect(new URL("/", request.url))
+    }
+
+    return response
   } catch (error) {
-    console.error("Middleware - Auth Error:", error)
-    // On error, redirect to login
-    return NextResponse.redirect(new URL("/login", req.url))
+    console.error("Middleware Error:", {
+      error,
+      path: request.nextUrl.pathname,
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV,
+    })
+
+    // On error in production, redirect to login
+    if (process.env.NODE_ENV === "production") {
+      return NextResponse.redirect(new URL("/login", request.url))
+    }
+
+    // In development, allow the error to be handled by error boundary
+    return NextResponse.next()
   }
 }
 
-// Update matcher to exclude static files
 export const config = {
   matcher: [
     /*
      * Match all request paths except for the ones starting with:
-     * - api (API routes)
      * - _next/static (static files)
      * - _next/image (image optimization files)
      * - favicon.ico (favicon file)
-     * - public folder
      */
-    "/((?!api|_next/static|_next/image|favicon.ico|.*\\.png$).*)",
+    "/((?!_next/static|_next/image|favicon.ico).*)",
   ],
 }
 
